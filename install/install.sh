@@ -4,7 +4,7 @@
 # ~/Documents/meetings/. Requires voxtype with meeting mode + ollama.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "$(dirname "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 BAR_MODULES="$HOME/.config/omarchy/bar/modules"
 VOXTYPE_CFG="$HOME/.config/voxtype"
