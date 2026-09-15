@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Meeting toggle: click once to start recording, click again to stop+summarize.
+# Summary + action items are saved as markdown in ~/Documents/meetings/.
+
+set -euo pipefail
+
+MEETINGS_DIR="$HOME/Documents/meetings"
+NOTIFY=(notify-send -a "voxtype")
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SUMMARY_STATE="$RUNTIME_DIR/voxtype/meeting_summary_state"
+LOG_FILE="$XDG_STATE_HOME/voxtype/meeting-toggle.log"
+
+mkdir -p "$MEETINGS_DIR" "$(dirname "$LOG_FILE")"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+
+echo "idle" > "$SUMMARY_STATE" 2>/dev/null || true
+log "invoked"
+
+function pick_voxtype() {
+  if [[ -x /usr/lib/voxtype/voxtype-onnx-avx512 ]]; then
+    echo "/usr/lib/voxtype/voxtype-onnx-avx512"
+  elif command -v voxtype-onnx-avx512 >/dev/null 2>&1; then
+    echo "voxtype-onnx-avx512"
+  else
+    echo "voxtype"
+  fi
+}
+
+function is_recording() {
+  local vx
+  vx=$(pick_voxtype)
+  $vx meeting status 2>/dev/null | grep -q "recording"
+}
+
+function start_meeting() {
+  local vx diar
+  vx=$(pick_voxtype)
+  if [[ "$vx" == "voxtype" ]]; then
+    diar=""
+  else
+    diar="--diarization ml"
+  fi
+  $vx meeting start -t "Bar meeting" $diar || {
+    "${NOTIFY[@]}" "Could not start recording"
+    log "start failed"
+    exit 1
+  }
+  log "started"
+  "${NOTIFY[@]}" "Recording started" "Click the mic in the bar to stop and summarize."
+}
+
+function stop_meeting() {
+  local vx transcript meeting_id
+  vx=$(pick_voxtype)
+  meeting_id=$(sed -n '2p' "$RUNTIME_DIR/voxtype/meeting_state" 2>/dev/null || true)
+  $vx meeting stop || true
+  "${NOTIFY[@]}" "Recording stopped — generating summary…" "This can take up to a minute."
+
+  transcribe_wait() {
+    local id="${1:-latest}"
+    $vx meeting export "$id" -f text --timestamps --speakers 2>/dev/null || true
+  }
+
+  # Transcription runs at ~1.7x realtime after stop, so a 60-min meeting can
+  # take ~35 min to become fully queryable. Poll until it stabilises instead
+  # of a fixed wait; bail after 45 min (howling silence / no audio).
+  local last_len=0 stable=0 len=0
+  for _ in $(seq 1 540); do
+    transcript=$(transcribe_wait "$meeting_id")
+    len=$(echo "$transcript" | wc -w)
+    if [[ "$len" -gt 0 ]]; then
+      if [[ "$len" -eq "$last_len" ]]; then
+        stable=$((stable + 1))
+      else
+        stable=0
+      fi
+      if (( stable >= 3 )); then
+        log "transcript settled: $len words"
+        break
+      fi
+    fi
+    last_len="$len"
+    sleep 5
+  done
+  if [[ -z "$transcript" ]]; then
+    "${NOTIFY[@]}" -u critical -t 0 "Nothing captured" \
+      "Meeting stopped but no transcript was found."
+    echo "error no-transcript" >> "$LOG_FILE" 2>/dev/null || true
+    return
+  fi
+
+  if ! pgrep -x ollama >/dev/null; then
+    systemctl --user start ollama 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      pgrep -x ollama >/dev/null && break
+      sleep 1
+    done
+  fi
+
+  local summary out_file ts
+  transcript=$(printf '%s' "$transcript" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g')
+  echo "working" > "$SUMMARY_STATE" 2>/dev/null || true
+  log "summarizing $(echo "$transcript" | wc -w) words"
+
+  OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+  OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:7b-ctx}"
+  prompt=$(cat <<'PROMPT'
+You are a meeting assistant. From the transcript below, produce markdown with exactly two sections:
+
+## Summary
+A concise but THOROUGH paragraph or bullet list covering every topic discussed in the transcript, including each distinct topic and decision.
+
+## Action Items
+A bulleted list of every task, owner, and deadline mentioned. If none, write "None."
+
+Cover the ENTIRE transcript from start to finish - do not skip later topics because it is long.
+
+Only output those two sections. Do not include the transcript.
+
+--- TRANSCRIPT ---
+PROMPT
+)${transcript}
+
+  summary=""
+  for _ in 1 2 3; do
+    payload=$(jq -nc --arg m "$OLLAMA_MODEL" --arg p "$prompt" \
+      '{model:$m, prompt:$p, stream:false, options:{num_ctx:16384, temperature:0.2}}')
+    if summary=$(curl -sf --max-time 900 -H "Content-Type: application/json" \
+        -d "$payload" "$OLLAMA_HOST/api/generate" | jq -r '.response // empty'); then
+      [[ -n "$summary" ]] && break
+    fi
+    sleep 10
+  done
+  if [[ -z "$summary" ]]; then
+    echo "error ollama-failed" >> "$LOG_FILE"
+    echo "idle" > "$SUMMARY_STATE" 2>/dev/null || true
+    "${NOTIFY[@]}" -u critical -t 0 "Summary failed" "Ollama could not generate the summary for this meeting."
+    exit 1
+  fi
+  ts=$(date +%Y-%m-%d_%H%M)
+  out_file="$MEETINGS_DIR/meeting-${ts}.md"
+  printf '# Meeting Summary\n\n%s\n' "$summary" > "$out_file"
+  echo "done" > "$SUMMARY_STATE" 2>/dev/null || true
+  log "saved $out_file"
+
+  # Critical urgency -> the omarchy notification daemon keeps it up until dismissed.
+  "${NOTIFY[@]}" -u critical -t 0 "Meeting summary ready" \
+    "Saved to $out_file"
+}
+
+if is_recording; then
+  stop_meeting
+else
+  start_meeting
+fi
