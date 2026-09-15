@@ -16,6 +16,65 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
 echo "idle" > "$SUMMARY_STATE" 2>/dev/null || true
 log "invoked"
 
+# Owner verification: an LLM will happily invent an owner from a name that was
+# merely mentioned or addressed (e.g. "Don't worry, Brad, you got this"). We
+# only keep an owner if that name co-occurs with explicit assignment language
+# somewhere in the transcript; everything else becomes "Unknown".
+OWNER_MARKERS='taking over |take over |in charge |responsible|point of contact|will handle|is handling|handles |will coordinate|coordinates|coordinator|will schedule|schedules |scheduling|sitting down with|will reach|reaching out to|will contact|will call|will send|follows? up on|heads? |owns|running the|runs the|in the lead|point person|get with |contact people|can contact|will get '
+
+owner_has_evidence() {
+  local transcript="$1" name="$2"
+  local n
+  n=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[.]//g')
+  printf '%s\n' "$transcript" | tr '[:upper:]' '[:lower:]' \
+    | awk -v n="$n" -v m="$OWNER_MARKERS" '
+        {
+          line = $0
+          pos = 1
+          while (pos > 0) {
+            start = index(substr(line, pos), n)
+            if (start == 0) break
+            start += pos - 1
+            # probe a tight window around the name so markers that merely
+            # appear elsewhere on a long speaker chunk do not count
+            lo = start - 150; if (lo < 1) lo = 1
+            hi = start + length(n) + 150; if (hi > length(line)) hi = length(line)
+            window = substr(line, lo, hi - lo)
+            if (window ~ m) found = 1
+            pos = start + length(n)
+          }
+        }
+        END { exit found ? 0 : 1 }'
+}
+
+verify_owners() {
+  local summary="$1" transcript="$2" out="" line field toks tok name
+  while IFS= read -r line; do
+    field=$(printf '%s' "$line" | grep -oE '\(Owner:[^)]*' | head -1)
+    if [[ -n "$field" ]]; then
+      toks="${field#(Owner:}"
+      IFS=',' read -ra toks <<< "$toks"
+      rebuilt=""
+      for tok in "${toks[@]}"; do
+        tok=$(printf '%s' "$tok" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if [[ -z "$tok" ]]; then
+          :
+        elif [[ "$tok" =~ [0-9] ]] || [[ "$tok" =~ ^(Deadline|deadline|Due|due|TBC|Ongoing|Continuous|Various|Unknown|None|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|January|February|March|April|May|June|July|August|September|October|November|December|every|week|month|year)((:[[:space:]]*)|[[:space:]]|$) ]]; then
+          rebuilt+=", $tok"
+        elif owner_has_evidence "$transcript" "$tok"; then
+          rebuilt+=", $tok"
+        else
+          log "owner unverified: $tok -> Unknown"
+          rebuilt+=", Unknown"
+        fi
+      done
+      line=$(printf '%s' "$line" | sed "s/(Owner:[^)]*/${rebuilt#, }/")
+    fi
+    out+="$line"$'\n'
+  done <<< "$summary"
+  printf '%s' "$out"
+}
+
 function pick_voxtype() {
   if [[ -x /usr/lib/voxtype/voxtype-onnx-avx512 ]]; then
     echo "/usr/lib/voxtype/voxtype-onnx-avx512"
@@ -111,7 +170,17 @@ You are a meeting assistant. From the transcript below, produce markdown with ex
 A concise but THOROUGH paragraph or bullet list covering every topic discussed in the transcript, including each distinct topic and decision.
 
 ## Action Items
-A bulleted list of every task, owner, and deadline mentioned. If none, write "None."
+A bulleted list of every task discussed. If none, write "None."
+
+Owner attribution rules (CRITICAL):
+- Assign an owner ONLY when the transcript EXPLICITLY states who is responsible for that task,
+  e.g. "John will handle the picnic" or "Scott is taking charge of safety training".
+- A name merely being ADDRESSED, greeted, or encouraged (e.g. "Don't worry, Brad, you got this")
+  is NOT assignment. Treated speech from other people (a name in a sentence someone else says)
+  is NOT assignment.
+- NEVER infer an owner from context, proximity, or "sounds like the person speaking".
+- If no explicit owner is stated, write "Owner: Unknown". Do not invent names.
+- Include a deadline only when one was actually stated aloud.
 
 Cover the ENTIRE transcript from start to finish - do not skip later topics because it is long.
 
@@ -137,6 +206,7 @@ PROMPT
     "${NOTIFY[@]}" -u critical -t 0 "Summary failed" "Ollama could not generate the summary for this meeting."
     exit 1
   fi
+  summary=$(verify_owners "$summary" "$transcript")
   ts=$(date +%Y-%m-%d_%H%M)
   out_file="$MEETINGS_DIR/meeting-${ts}.md"
   printf '# Meeting Summary\n\n%s\n' "$summary" > "$out_file"
