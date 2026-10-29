@@ -5,9 +5,10 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Meeting recorder toggle for the bar. Click to start recording a meeting,
-// click again to stop and generate a markdown summary (Summary + Action
-// Items) saved to ~/Documents/meetings/. Custom bar module, loaded as:
+// Meeting recorder toggle for the bar. Left-click to start recording,
+// left-click again to stop and generate a markdown summary (Summary +
+// Action Items). Right-click picks the summary mode: normal meeting notes
+// or in-depth training notes. Custom bar module, loaded as:
 // `type: "qml"` from ~/.config/omarchy/bar/modules/meeting-toggle.qml.
 //
 // States:
@@ -20,6 +21,7 @@ BarWidget {
 
   property bool recording: false
   property bool summarizing: false
+  property bool popupOpen: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -45,11 +47,27 @@ BarWidget {
   }
 
   function toggle() {
+    chooseMode("")
+  }
+
+  // Run the toggle script with an explicit summary mode ("normal",
+  // "training", or "" for the remembered/default mode). The right-click
+  // picker uses this; left-click keeps the old behavior via "".
+  function chooseMode(mode) {
     if (toggleProc.running) return
-    runProc(toggleProc, ["bash", "-lc", 'PATH="$HOME/.local/bin:$PATH"; command -v meetnote >/dev/null && meetnote || notify-send -a voxtype "meetnote missing" "Run the meetnote installer"'])
+    root.popupOpen = false
+    var cmd = 'PATH="$HOME/.local/bin:$PATH"; command -v meetnote >/dev/null && meetnote'
+    if (mode !== "") cmd += ' --mode ' + mode
+    cmd += ' || notify-send -a voxtype "meetnote missing" "Run the meetnote installer"'
+    runProc(toggleProc, ["bash", "-lc", cmd])
     // Recording state flips immediately so the button responds; poll will
     // correct itself once the toggle script finishes.
     root.recording = !root.recording
+  }
+
+  // Called by PopupCard on outside-click dismissal (HyprlandFocusGrab).
+  function close() {
+    root.popupOpen = false
   }
 
   Process {
@@ -94,8 +112,8 @@ BarWidget {
     activeColor: root.summarizing ? root.colorSummarizing : root.colorRecording
     foreground: root.recording ? root.colorRecording
               : root.summarizing ? root.colorSummarizing : root.colorIdle
-    tooltipText: root.summarizing ? "Generating meeting summary…"
-               : (root.recording ? "Stop meeting and summarize" : "Start meeting recording")
+    tooltipText: root.summarizing ? "Generating summary…"
+               : (root.recording ? "Stop and summarize (right-click for mode)" : "Start recording (right-click for training mode)")
     // Slow spin while summarizing to make it visually distinct.
     NumberAnimation on textRotation {
       running: root.summarizing
@@ -106,6 +124,63 @@ BarWidget {
     }
     onPressed: function(btn) {
       if (btn === Qt.LeftButton) root.toggle()
+      else if (btn === Qt.RightButton) root.popupOpen = !root.popupOpen
+    }
+  }
+
+  PopupCard {
+    id: popup
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.popupOpen
+    contentWidth: popup.fittedContentWidth(Style.space(280))
+    contentHeight: popup.fittedContentHeight(column.implicitHeight)
+
+    Column {
+      id: column
+      anchors.fill: parent
+      spacing: Style.space(6)
+
+      Text {
+        width: parent.width
+        text: root.recording ? "Stop & summarize" : "Start recording"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
+        horizontalAlignment: Text.AlignHCenter
+      }
+
+      Item {
+        width: parent.width
+        height: 1
+        Rectangle {
+          anchors.fill: parent
+          color: Color.popups.border
+          opacity: 0.5
+        }
+      }
+
+      Button {
+        width: parent.width
+        text: root.recording ? "Meeting summary" : "Meeting"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        leftAlign: true
+        fontSize: Style.font.body
+        onClicked: root.chooseMode("normal")
+      }
+
+      Button {
+        width: parent.width
+        text: root.recording ? "Training notes" : "Training (in-depth)"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        leftAlign: true
+        fontSize: Style.font.body
+        onClicked: root.chooseMode("training")
+      }
     }
   }
 }

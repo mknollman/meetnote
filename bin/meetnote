@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Meeting toggle: click once to start recording, click again to stop+summarize.
-# Summary + action items are saved as markdown in ~/Documents/meetings/.
+# Notes are saved as markdown in the meetings dir (see MEETINGS_DIR below).
+#
+# Summary modes: "normal" (default) or "training" (in-depth, learning focused).
+# Usage: meetnote [--mode normal|training] [--training] [--normal]
+# Env: MEETNOTE_MODE. The mode given at start is remembered; a mode given at
+# stop overrides it for that summary.
 
 set -euo pipefail
 
@@ -15,6 +20,39 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
 
 echo "idle" > "$SUMMARY_STATE" 2>/dev/null || true
 log "invoked"
+
+MODE_FILE="$RUNTIME_DIR/voxtype/meeting_mode"
+CLI_MODE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode|-m)
+      CLI_MODE="${2:-}"; shift 2 ;;
+    --mode=*)
+      CLI_MODE="${1#--mode=}"; shift ;;
+    --training)
+      CLI_MODE="training"; shift ;;
+    --normal)
+      CLI_MODE="normal"; shift ;;
+    -h|--help)
+      echo "Usage: meetnote [--mode normal|training] [--training] [--normal]"; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+resolve_mode() {
+  local m="${CLI_MODE:-}"
+  if [[ -z "$m" && -f "$MODE_FILE" ]]; then
+    m=$(cat "$MODE_FILE" 2>/dev/null || true)
+  fi
+  if [[ -z "$m" ]]; then
+    m="${MEETNOTE_MODE:-normal}"
+  fi
+  case "$m" in
+    normal|training) printf '%s' "$m" ;;
+    *) log "unknown mode '$m', falling back to normal"; printf 'normal' ;;
+  esac
+}
 
 # Owner verification: an LLM will happily invent an owner from a name that was
 # merely mentioned or addressed (e.g. "Don't worry, Brad, you got this"). We
@@ -85,6 +123,72 @@ function pick_voxtype() {
   fi
 }
 
+build_prompt() {
+  case "$1" in
+    training) cat <<'PROMPT'
+You are a training assistant. From the transcript below, produce markdown with exactly these sections:
+
+## Summary
+A concise paragraph covering the main topics of the training session.
+
+## Key Concepts
+A thorough bullet list of every concept, term, procedure, or idea taught. Define each briefly based on what was actually said.
+
+## Details & Examples
+Expand on each key concept with the details, steps, examples, anecdotes, and explanations given in the transcript. This section should be in-depth - someone who missed the training should be able to learn from it. Include specifics (names, numbers, tools, sequences) stated aloud.
+
+## Action Items
+A bulleted list of every task, practice item, or follow-up discussed. If none, write "None."
+
+## Open Questions
+Anything left unresolved, unclear, or marked for follow-up in the transcript. If none, write "None."
+
+Owner attribution rules (CRITICAL):
+- Assign an owner ONLY when the transcript EXPLICITLY states who is responsible for that task,
+  e.g. "John will handle the picnic" or "Scott is taking charge of safety training".
+- A name merely being ADDRESSED, greeted, or encouraged (e.g. "Don't worry, Brad, you got this")
+  is NOT assignment. Treated speech from other people (a name in a sentence someone else says)
+  is NOT assignment.
+- NEVER infer an owner from context, proximity, or "sounds like the person speaking".
+- If no explicit owner is stated, write "Owner: Unknown". Do not invent names.
+- Include a deadline only when one was actually stated aloud.
+
+Cover the ENTIRE transcript from start to finish - do not skip later topics because it is long.
+
+Only output those sections. Do not include the transcript.
+
+--- TRANSCRIPT ---
+PROMPT
+      ;;
+    *) cat <<'PROMPT'
+You are a meeting assistant. From the transcript below, produce markdown with exactly two sections:
+
+## Summary
+A concise but THOROUGH paragraph or bullet list covering every topic discussed in the transcript, including each distinct topic and decision.
+
+## Action Items
+A bulleted list of every task discussed. If none, write "None."
+
+Owner attribution rules (CRITICAL):
+- Assign an owner ONLY when the transcript EXPLICITLY states who is responsible for that task,
+  e.g. "John will handle the picnic" or "Scott is taking charge of safety training".
+- A name merely being ADDRESSED, greeted, or encouraged (e.g. "Don't worry, Brad, you got this")
+  is NOT assignment. Treated speech from other people (a name in a sentence someone else says)
+  is NOT assignment.
+- NEVER infer an owner from context, proximity, or "sounds like the person speaking".
+- If no explicit owner is stated, write "Owner: Unknown". Do not invent names.
+- Include a deadline only when one was actually stated aloud.
+
+Cover the ENTIRE transcript from start to finish - do not skip later topics because it is long.
+
+Only output those two sections. Do not include the transcript.
+
+--- TRANSCRIPT ---
+PROMPT
+      ;;
+  esac
+}
+
 function is_recording() {
   local vx
   vx=$(pick_voxtype)
@@ -92,28 +196,44 @@ function is_recording() {
 }
 
 function start_meeting() {
-  local vx diar
+  local mode="$1"
+  local vx diar title
   vx=$(pick_voxtype)
   if [[ "$vx" == "voxtype" ]]; then
     diar=""
   else
     diar="--diarization ml"
   fi
-  $vx meeting start -t "Bar meeting" $diar || {
+  if [[ "$mode" == "training" ]]; then
+    title="Bar training"
+  else
+    title="Bar meeting"
+  fi
+  printf '%s' "$mode" > "$MODE_FILE" 2>/dev/null || true
+  $vx meeting start -t "$title" $diar || {
     "${NOTIFY[@]}" "Could not start recording"
     log "start failed"
     exit 1
   }
-  log "started"
-  "${NOTIFY[@]}" "Recording started" "Click the mic in the bar to stop and summarize."
+  log "started mode=$mode"
+  if [[ "$mode" == "training" ]]; then
+    "${NOTIFY[@]}" "Recording started (training mode)" "Click the mic in the bar to stop and generate training notes."
+  else
+    "${NOTIFY[@]}" "Recording started" "Click the mic in the bar to stop and summarize."
+  fi
 }
 
 function stop_meeting() {
+  local mode="$1"
   local vx transcript meeting_id
   vx=$(pick_voxtype)
   meeting_id=$(sed -n '2p' "$RUNTIME_DIR/voxtype/meeting_state" 2>/dev/null || true)
   $vx meeting stop || true
-  "${NOTIFY[@]}" "Recording stopped — generating summary…" "This can take up to a minute."
+  if [[ "$mode" == "training" ]]; then
+    "${NOTIFY[@]}" "Recording stopped — generating training notes…" "This can take up to a minute."
+  else
+    "${NOTIFY[@]}" "Recording stopped — generating summary…" "This can take up to a minute."
+  fi
 
   transcribe_wait() {
     local id="${1:-latest}"
@@ -159,36 +279,11 @@ function stop_meeting() {
   local summary out_file ts
   transcript=$(printf '%s' "$transcript" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g')
   echo "working" > "$SUMMARY_STATE" 2>/dev/null || true
-  log "summarizing $(echo "$transcript" | wc -w) words"
+  log "summarizing mode=$mode $(echo "$transcript" | wc -w) words"
 
   OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
   OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:7b-ctx}"
-  prompt=$(cat <<'PROMPT'
-You are a meeting assistant. From the transcript below, produce markdown with exactly two sections:
-
-## Summary
-A concise but THOROUGH paragraph or bullet list covering every topic discussed in the transcript, including each distinct topic and decision.
-
-## Action Items
-A bulleted list of every task discussed. If none, write "None."
-
-Owner attribution rules (CRITICAL):
-- Assign an owner ONLY when the transcript EXPLICITLY states who is responsible for that task,
-  e.g. "John will handle the picnic" or "Scott is taking charge of safety training".
-- A name merely being ADDRESSED, greeted, or encouraged (e.g. "Don't worry, Brad, you got this")
-  is NOT assignment. Treated speech from other people (a name in a sentence someone else says)
-  is NOT assignment.
-- NEVER infer an owner from context, proximity, or "sounds like the person speaking".
-- If no explicit owner is stated, write "Owner: Unknown". Do not invent names.
-- Include a deadline only when one was actually stated aloud.
-
-Cover the ENTIRE transcript from start to finish - do not skip later topics because it is long.
-
-Only output those two sections. Do not include the transcript.
-
---- TRANSCRIPT ---
-PROMPT
-)${transcript}
+  prompt="$(build_prompt "$mode")${transcript}"
 
   summary=""
   for _ in 1 2 3; do
@@ -208,18 +303,30 @@ PROMPT
   fi
   summary=$(verify_owners "$summary" "$transcript")
   ts=$(date +%Y-%m-%d_%H%M)
-  out_file="$MEETINGS_DIR/meeting-${ts}.md"
-  printf '# Meeting Summary\n\n%s\n' "$summary" > "$out_file"
+  if [[ "$mode" == "training" ]]; then
+    out_file="$MEETINGS_DIR/meeting-${ts}-training.md"
+    printf '# Training Notes\n\n%s\n' "$summary" > "$out_file"
+  else
+    out_file="$MEETINGS_DIR/meeting-${ts}.md"
+    printf '# Meeting Summary\n\n%s\n' "$summary" > "$out_file"
+  fi
+  rm -f "$MODE_FILE" 2>/dev/null || true
   echo "done" > "$SUMMARY_STATE" 2>/dev/null || true
   log "saved $out_file"
 
   # Critical urgency -> the omarchy notification daemon keeps it up until dismissed.
-  "${NOTIFY[@]}" -u critical -t 0 "Meeting summary ready" \
-    "Saved to $out_file"
+  if [[ "$mode" == "training" ]]; then
+    "${NOTIFY[@]}" -u critical -t 0 "Training notes ready" \
+      "Saved to $out_file"
+  else
+    "${NOTIFY[@]}" -u critical -t 0 "Meeting summary ready" \
+      "Saved to $out_file"
+  fi
 }
 
+MODE=$(resolve_mode)
 if is_recording; then
-  stop_meeting
+  stop_meeting "$MODE"
 else
-  start_meeting
+  start_meeting "$MODE"
 fi

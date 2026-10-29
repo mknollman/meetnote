@@ -1,7 +1,7 @@
 # meetnote
 
 Record a meeting from an Omarchy bar toggle; stop to get an AI summary with
-action items, saved as markdown in `~/Documents/meetings/`.
+action items - or in-depth training notes for learning sessions, saved as markdown in `~/Documents/meetings/`.
 
 Built on [voxtype](https://github.com/FFXv/voxtype) meeting mode
 (continuous transcription) + a local [Ollama](https://ollama.com) model for
@@ -33,10 +33,20 @@ After install: restart the omarchy shell and the voxtype daemon.
 
 ## Usage
 
-Click the mic:
+Left-click the mic:
 - **idle** (dim) → starts recording
 - **recording** (red stop) → stops and generates the summary
 - **summarizing** (amber spinner) → generation in progress
+
+Right-click the mic to pick the summary mode:
+- **Meeting** — standard summary + action items
+- **Training (in-depth)** — learning-focused notes: summary, key concepts,
+  details & examples, action items, open questions (saved with a
+  `-training` suffix on the filename)
+
+Same from the terminal: `meetnote --mode training` (or set
+`MEETNOTE_MODE=training`). The mode picked at start is remembered; a mode
+given at stop overrides it for that summary.
 
 The bar widget polls `$XDG_RUNTIME_DIR/voxtype/meeting_state` and
 `meeting_summary_state`; the toggle script logs to
@@ -48,13 +58,14 @@ The bar widget polls `$XDG_RUNTIME_DIR/voxtype/meeting_state` and
 
 - `OLLAMA_HOST` — point at another machine (default `http://127.0.0.1:11434`)
 - `OLLAMA_MODEL` — which model to use (default `qwen2.5:7b-ctx`)
+- `MEETNOTE_MODE` — `normal` (default) or `training`
 
 The transcription model (whisper) is configured in the installed voxtype
 `config.toml` (`base.en` by default).
 
 ## Layout
 
-- `bin/meetnote` — the start/stop + summarize toggle script
+- `bin/meetnote` — the start/stop + summarize toggle script (`--mode normal|training`)
 - `qml/meeting-toggle.qml` — omarchy bar module (idle/recording/summarizing)
 - `config/voxtype/config.toml` — voxtype: meeting mode on, 2h cap per clip
 - `config/systemd/user/ollama.service` — autostart ollama
